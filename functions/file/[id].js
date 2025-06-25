@@ -7,7 +7,7 @@ export async function onRequest(context) {
 
     const url = new URL(request.url);
     let fileUrl = 'https://telegra.ph/' + url.pathname + url.search
-    if (url.pathname.length > 39) {
+    if (url.pathname.length > 39) { // Path length > 39 indicates file uploaded via Telegram Bot API
         const formdata = new FormData();
         formdata.append("file_id", url.pathname);
 
@@ -21,8 +21,7 @@ export async function onRequest(context) {
         console.log(url.pathname.split(".")[0].split("/")[2])
         const filePath = await getFilePath(env, url.pathname.split(".")[0].split("/")[2]);
         console.log(filePath)
-        fileUrl = `https://api.telegram.org/file/bot${env.TG_Bot_Token}/${filePath}`;  
-
+        fileUrl = `https://api.telegram.org/file/bot${env.TG_Bot_Token}/${filePath}`;
     }
 
     const response = await fetch(fileUrl, {
@@ -31,78 +30,101 @@ export async function onRequest(context) {
         body: request.body,
     });
 
+    // If the response is OK, proceed with further checks
+    if (!response.ok) return response;
+
     // Log response details
     console.log(response.ok, response.status);
 
-    // If the response is OK, proceed with further checks
-    if (response.ok) {
-        // Allow the admin page to directly view the image
-        if (request.headers.get('Referer') === `${url.origin}/admin`) {
-            return response;
-        }
+    // Allow the admin page to directly view the image
+    const isAdmin = request.headers.get('Referer')?.includes(`${url.origin}/admin`);
+    if (isAdmin) {
+        return response;
+    }
 
-        // Fetch KV metadata if available
-        if (env.img_url) {
-            const record = await env.img_url.getWithMetadata(params.id);
-            console.log("Record:", record);
+    // Check if KV storage is available
+    if (!env.img_url) {
+        console.log("KV storage not available, returning image directly");
+        return response;  // Directly return image response, terminate execution
+    }
 
-            // Ensure metadata exists and add default values for missing properties
-            if (record && record.metadata) {
-                const metadata = {
-                    ListType: record.metadata.ListType || "None",
-                    Label: record.metadata.Label || "None",
-                    TimeStamp: record.metadata.TimeStamp || Date.now(),
-                    liked: record.metadata.liked !== undefined ? record.metadata.liked : false
-                };
+    // The following code executes only if KV is available
+    let record = await env.img_url.getWithMetadata(params.id);
+    if (!record || !record.metadata) {
+        // Initialize metadata if it doesn't exist
+        console.log("Metadata not found, initializing...");
+        record = {
+            metadata: {
+                ListType: "None",
+                Label: "None",
+                TimeStamp: Date.now(),
+                liked: false,
+                fileName: params.id,
+                fileSize: 0,
+            }
+        };
+        await env.img_url.put(params.id, "", { metadata: record.metadata });
+    }
 
-                // Handle based on ListType and Label
-                if (metadata.ListType === "White") {
-                    return response;
-                } else if (metadata.ListType === "Block" || metadata.Label === "adult") {
-                    const referer = request.headers.get('Referer');
-                    const redirectUrl = referer ? "https://static-res.pages.dev/teleimage/img-block-compressed.png" : `${url.origin}/block-img.html`;
-                    return Response.redirect(redirectUrl, 302);
-                }
+    const metadata = {
+        ListType: record.metadata.ListType || "None",
+        Label: record.metadata.Label || "None",
+        TimeStamp: record.metadata.TimeStamp || Date.now(),
+        liked: record.metadata.liked !== undefined ? record.metadata.liked : false,
+        fileName: record.metadata.fileName || params.id,
+        fileSize: record.metadata.fileSize || 0,
+    };
 
-                // Check if WhiteList_Mode is enabled
-                if (env.WhiteList_Mode === "true") {
-                    return Response.redirect(`${url.origin}/whitelist-on.html`, 302);
-                }
+    // Handle based on ListType and Label
+    if (metadata.ListType === "White") {
+        return response;
+    } else if (metadata.ListType === "Block" || metadata.Label === "adult") {
+        const referer = request.headers.get('Referer');
+        const redirectUrl = referer ? "https://static-res.pages.dev/teleimage/img-block-compressed.png" : `${url.origin}/block-img.html`;
+        return Response.redirect(redirectUrl, 302);
+    }
+
+    // Check if WhiteList_Mode is enabled
+    if (env.WhiteList_Mode === "true") {
+        return Response.redirect(`${url.origin}/whitelist-on.html`, 302);
+    }
+
+    // If no metadata or further actions required, moderate content and add to KV if needed
+    if (env.ModerateContentApiKey) {
+        try {
+            console.log("Starting content moderation...");
+            const moderateUrl = `https://api.moderatecontent.com/moderate/?key=${env.ModerateContentApiKey}&url=https://telegra.ph${url.pathname}${url.search}`;
+            const moderateResponse = await fetch(moderateUrl);
+
+            if (!moderateResponse.ok) {
+                console.error("Content moderation API request failed: " + moderateResponse.status);
             } else {
-                // If metadata does not exist, initialize it in KV with default values
-                await env.img_url.put(params.id, "", {
-                    metadata: { ListType: "None", Label: "None", TimeStamp: Date.now(), liked: false },
-                });
-            }
-        }
+                const moderateData = await moderateResponse.json();
+                console.log("Content moderation results:", moderateData);
 
-        // If no metadata or further actions required, moderate content and add to KV if needed
-        const time = Date.now();
-        if (env.ModerateContentApiKey) {
-            const moderateResponse = await fetch(`https://api.moderatecontent.com/moderate/?key=${env.ModerateContentApiKey}&url=https://telegra.ph${url.pathname}${url.search}`);
-            const moderateData = await moderateResponse.json();
-            console.log("Moderate Data:", moderateData);
+                if (moderateData && moderateData.rating_label) {
+                    metadata.Label = moderateData.rating_label;
 
-            if (env.img_url) {
-                await env.img_url.put(params.id, "", {
-                    metadata: { ListType: "None", Label: moderateData.rating_label, TimeStamp: time, liked: false },
-                });
+                    if (moderateData.rating_label === "adult") {
+                        console.log("Content marked as adult, saving metadata and redirecting");
+                        await env.img_url.put(params.id, "", { metadata });
+                        return Response.redirect(`${url.origin}/block-img.html`, 302);
+                    }
+                }
             }
-
-            if (moderateData.rating_label === "adult") {
-                return Response.redirect(`${url.origin}/block-img.html`, 302);
-            }
-        } else if (env.img_url) {
-            // Add image to KV with default metadata if ModerateContentApiKey is not available
-            console.log("KV not enabled for moderation, adding default metadata.");
-            await env.img_url.put(params.id, "", {
-                metadata: { ListType: "None", Label: "None", TimeStamp: time, liked: false },
-            });
+        } catch (error) {
+            console.error("Error during content moderation: " + error.message);
+            // Moderation failure should not affect user experience, continue processing
         }
     }
 
-    return response;
+    // Only save metadata if content is not adult content
+    // Adult content cases are already handled above and will not reach this point
+    console.log("Saving metadata");
+    await env.img_url.put(params.id, "", { metadata });
 
+    // Return file content
+    return response;
 }
 
 async function getFilePath(env, file_id) {
